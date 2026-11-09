@@ -203,6 +203,28 @@ class TPUEngineOptions:
             matmul, sharing the routed-token loads (default: ``False``).
         moe_native_weight_layout: Qwen3 MoE: store the expert weights in the kernel-native ``(E, K, N)`` layout;
             ``state_dict()`` / ``load_state_dict()`` still use the canonical layout and names (default: ``False``).
+        trainer_mode: How the actor's training step runs: ``eager_blocks`` (default: TorchTitan ``Trainer``,
+            per-TransformerBlock ``torch.compile`` and eager loss / backward) or ``graph_trainer`` (TorchTitan's
+            ``TpuGraphTrainer`` traces forward + RL loss + backward of a micro-batch into one graph and compiles it
+            whole, see ``engines/graph_trainer_mode.py``). ``graph_trainer`` needs ``use_simple_fsdp`` and
+            ``static_micro_batch_len`` (one traced shape for every micro-batch) and trains actors only.
+        graph_trainer_memory_policy: ``graph_trainer`` activation memory policy (TorchTitan's
+            ``graph_trainer_memory_policy``, e.g. ``full``, ``default``, ``tpu_selective``; default: ``full`` with
+            ``activation_checkpoint=full``, ``default`` with ``selective``, ``none`` without).
+        graph_trainer_save_regions: ``graph_trainer`` with ``tpu_selective``: comma-separated regions to save
+            instead of recomputing (e.g. ``moe.routing,attention.inner_attention``, as TorchTitan's Qwen3-30B-A3B
+            SFT recipe).
+        graph_trainer_fsdp_schedule: ``graph_trainer`` FSDP all-gather schedule, ``none`` (default), ``prefetch`` or
+            ``interleave``; anything but ``none`` also turns on TorchTitan's remat schedule. ZeRO-3
+            (``reshard_after_forward=always``) needs ``prefetch`` / ``interleave`` for XLA not to keep every
+            all-gathered parameter through the backward.
+        graph_trainer_autocast: ``graph_trainer``: trace the step under ``torch.autocast(bfloat16)``, as the eager
+            engine runs it (default: ``True``).
+        graph_trainer_f32_embedding_grad: ``graph_trainer``: the token-embedding backward accumulates the
+            gradient rows of repeated tokens in FP32 and casts once at the end (default: ``False``). The traced
+            ``aten.embedding_backward`` accumulates in the BF16 gradient dtype; this costs an FP32
+            ``vocab x hidden`` buffer per device. It did not explain the v7x embedding-gradient gap of the P1
+            parity check (random tokens rarely repeat), so it is off by default.
     """
 
     use_splash_attention: Optional[bool] = None
@@ -230,6 +252,12 @@ class TPUEngineOptions:
     mixed_precision_reduce: Optional[str] = None
     moe_paired_grouped_mm: Optional[bool] = None
     moe_native_weight_layout: Optional[bool] = None
+    trainer_mode: Optional[str] = None
+    graph_trainer_memory_policy: Optional[str] = None
+    graph_trainer_save_regions: Optional[str] = None
+    graph_trainer_fsdp_schedule: Optional[str] = None
+    graph_trainer_autocast: Optional[bool] = None
+    graph_trainer_f32_embedding_grad: Optional[bool] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -258,8 +286,20 @@ _ENGINE_KINDS: dict[str, type] = {
     "mixed_precision_reduce": str,
     "moe_paired_grouped_mm": bool,
     "moe_native_weight_layout": bool,
+    "trainer_mode": str,
+    "graph_trainer_memory_policy": str,
+    "graph_trainer_save_regions": str,
+    "graph_trainer_fsdp_schedule": str,
+    "graph_trainer_autocast": bool,
+    "graph_trainer_f32_embedding_grad": bool,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
+
+# engine_kwargs.tpu.trainer_mode values.
+TRAINER_MODE_EAGER_BLOCKS = "eager_blocks"
+TRAINER_MODE_GRAPH_TRAINER = "graph_trainer"
+_TRAINER_MODES = (TRAINER_MODE_EAGER_BLOCKS, TRAINER_MODE_GRAPH_TRAINER)
+_GRAPH_TRAINER_FSDP_SCHEDULES = ("none", "prefetch", "interleave")
 
 # Deprecated channels, read for compatibility: option -> environment variable / top-level config field.
 _ENGINE_LEGACY_ENV_VARS = {
@@ -324,7 +364,33 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.ep_token_chunks must be >= 1, got {values['ep_token_chunks']!r}"
         )
+    _normalize_trainer_mode(values)
     return TPUEngineOptions(**values)
+
+
+def _normalize_trainer_mode(values: dict[str, Any]) -> None:
+    """Checks ``trainer_mode`` and its ``graph_trainer_*`` sub-options (lower-cased in place)."""
+    key = f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}"
+    if values.get("trainer_mode") is not None:
+        mode = values["trainer_mode"].strip().lower()
+        if mode not in _TRAINER_MODES:
+            raise ValueError(f"{key}.trainer_mode must be one of {_TRAINER_MODES}, got {values['trainer_mode']!r}")
+        values["trainer_mode"] = mode
+    graph_options = sorted(
+        name for name, value in values.items() if name.startswith("graph_trainer_") and value is not None
+    )
+    if graph_options and values.get("trainer_mode") != TRAINER_MODE_GRAPH_TRAINER:
+        raise ValueError(f"{key}.{graph_options} only apply with {key}.trainer_mode={TRAINER_MODE_GRAPH_TRAINER}")
+    if values.get("graph_trainer_fsdp_schedule") is not None:
+        schedule = values["graph_trainer_fsdp_schedule"].strip().lower()
+        if schedule not in _GRAPH_TRAINER_FSDP_SCHEDULES:
+            raise ValueError(
+                f"{key}.graph_trainer_fsdp_schedule must be one of {_GRAPH_TRAINER_FSDP_SCHEDULES}, "
+                f"got {values['graph_trainer_fsdp_schedule']!r}"
+            )
+        values["graph_trainer_fsdp_schedule"] = schedule
+    if values.get("graph_trainer_memory_policy") is not None:
+        values["graph_trainer_memory_policy"] = values["graph_trainer_memory_policy"].strip()
 
 
 # ---------------------------------------------------------------------------------------------------------------

@@ -911,7 +911,9 @@ def _relax_non_static_ep_moe_compile(model: nn.Module, *, parallel_dims: Any, co
             block._tpu_compile_relaxed = True  # type: ignore[attr-defined]
 
 
-def get_tpu_simple_fsdp_parallelize_fn(torchtitan_name: str) -> Callable[..., nn.Module]:
+def get_tpu_simple_fsdp_parallelize_fn(
+    torchtitan_name: str, tpu_compile_mode: Optional[str] = None
+) -> Callable[..., nn.Module]:
     """Return torchtitan's TPU recipe ``parallelize_fn`` for ``torchtitan_name``; it shards with SimpleFSDP.
 
     With ``ParallelismConfig.use_simple_fsdp`` set, the recipe (``torchtitan/experiments/tpu/<model>/infra/
@@ -919,6 +921,10 @@ def get_tpu_simple_fsdp_parallelize_fn(torchtitan_name: str) -> Callable[..., nn
     through the model's own ``parallelize_fn`` (``skip_dp=True``), picks shard dims that divide evenly, and
     shards every parameter with ``graph_trainer``'s SimpleFSDP. Under ``torch.compile`` the FSDP collectives
     live inside each compiled TransformerBlock.
+
+    ``tpu_compile_mode`` (the recipe's ``layer`` / ``fullgraph`` / ``aot_fx_trace``) is passed through when set:
+    ``aot_fx_trace`` (``engine_kwargs.tpu.trainer_mode=graph_trainer``) skips the per-block compile, so TorchTitan's
+    graph trainer can trace the whole step, and still shards with SimpleFSDP.
     """
     try:
         module_name, fn_name = _TPU_SIMPLE_FSDP_RECIPES[torchtitan_name]
@@ -929,9 +935,16 @@ def get_tpu_simple_fsdp_parallelize_fn(torchtitan_name: str) -> Callable[..., nn
         ) from None
     recipe_module = importlib.import_module(module_name)
     recipe_parallelize_fn = getattr(recipe_module, fn_name)
+    if tpu_compile_mode is not None and "tpu_compile_mode" not in inspect.signature(recipe_parallelize_fn).parameters:
+        raise ValueError(
+            f"tpu_compile_mode={tpu_compile_mode!r} needs a torchtitan TPU recipe parallelize_fn that accepts it; "
+            f"{module_name}.{fn_name} does not"
+        )
 
     def _parallelize(model: nn.Module, **kwargs: Any) -> nn.Module:
         parallel_dims = kwargs.get("parallel_dims")
+        if tpu_compile_mode is not None:
+            kwargs["tpu_compile_mode"] = tpu_compile_mode
         ep_needs_edp_wrap = (
             bool(getattr(parallel_dims, "ep_enabled", False))
             and not hasattr(recipe_module, "apply_qwen3_5_simple_fsdp")

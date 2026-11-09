@@ -51,8 +51,10 @@ per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 `+actor_rollout_ref.actor.torchtitan.engine_kwargs.tpu.use_simple_fsdp=False`. Supported keys:
 `use_splash_attention`, `use_simple_fsdp`, `use_fused_linear_cross_entropy`, `fuse_qkv`,
 `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`,
-`mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `model_kernels`, `ep_capacity_factor` and
-`context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
+`mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`,
+`graph_trainer_memory_policy`, `graph_trainer_save_regions`, `graph_trainer_fsdp_schedule`,
+`graph_trainer_autocast`, `graph_trainer_f32_embedding_grad`, `model_kernels`,
+`ep_capacity_factor` and `context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
 deprecated and log a warning.
 
 Qwen3 MoE models (HF `qwen3_moe`, e.g. Qwen3-30B-A3B) need no extra option. The engine turns off torchtitan's
@@ -81,6 +83,7 @@ Performance options for long packed micro-batches (the Qwen3-30B-A3B recipe sets
 | `moe_paired_grouped_mm: true` | Qwen3 MoE: torchtitan's paired W1/W3 Pallas grouped matmul (shares the routed-token loads) |
 | `moe_native_weight_layout: true` | Qwen3 MoE: kernel-native `(E, K, N)` expert weights; `state_dict()` / `load_state_dict()` keep the canonical layout and names, so the HF load and the tpu-sync expert export are unchanged |
 | `mixed_precision_reduce: bfloat16` | bf16 FSDP gradient reduce-scatter instead of fp32 (half the traffic; a performance A/B option) |
+| `trainer_mode: graph_trainer` | Actor only (bypass mode, KL loss off, `use_simple_fsdp=True`, `static_micro_batch_len` set): traces the micro-batch forward, fused LM-head log-prob, dual-clip PPO loss and backward once with TorchTitan's `TpuGraphTrainer` (`aot_fx_trace`) and compiles it as one PJRT executable instead of per-block `torch.compile`; configured with `graph_trainer_memory_policy` (e.g. `tpu_selective`), `graph_trainer_save_regions` (e.g. `moe.routing,attention.inner_attention`) and `graph_trainer_fsdp_schedule` (`none`, `prefetch`, `interleave`) |
 
 The rollout settings that matter on TPU (the recipes already set them):
 
