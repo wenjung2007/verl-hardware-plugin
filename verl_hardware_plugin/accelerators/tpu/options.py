@@ -216,8 +216,10 @@ class TPUEngineOptions:
             SFT recipe).
         graph_trainer_fsdp_schedule: ``graph_trainer`` FSDP all-gather schedule, ``none`` (default), ``prefetch`` or
             ``interleave``; anything but ``none`` also turns on TorchTitan's remat schedule. ZeRO-3
-            (``reshard_after_forward=always``) needs ``prefetch`` / ``interleave`` for XLA not to keep every
-            all-gathered parameter through the backward.
+            (``reshard_after_forward=always``) needs ``prefetch`` / ``interleave`` or ``graph_trainer_use_graph_split``
+            for XLA not to keep every all-gathered parameter through the backward.
+        graph_trainer_use_graph_split: ``graph_trainer``: compile the joint graph as forward/backward layer ranges
+            (TorchTitan's ``use_graph_split``) instead of one executable (default: ``False``).
         graph_trainer_autocast: ``graph_trainer``: trace the step under ``torch.autocast(bfloat16)``, as the eager
             engine runs it (default: ``True``).
         graph_trainer_f32_embedding_grad: ``graph_trainer``: the token-embedding backward accumulates the
@@ -256,6 +258,7 @@ class TPUEngineOptions:
     graph_trainer_memory_policy: Optional[str] = None
     graph_trainer_save_regions: Optional[str] = None
     graph_trainer_fsdp_schedule: Optional[str] = None
+    graph_trainer_use_graph_split: Optional[bool] = None
     graph_trainer_autocast: Optional[bool] = None
     graph_trainer_f32_embedding_grad: Optional[bool] = None
 
@@ -290,6 +293,7 @@ _ENGINE_KINDS: dict[str, type] = {
     "graph_trainer_memory_policy": str,
     "graph_trainer_save_regions": str,
     "graph_trainer_fsdp_schedule": str,
+    "graph_trainer_use_graph_split": bool,
     "graph_trainer_autocast": bool,
     "graph_trainer_f32_embedding_grad": bool,
 }

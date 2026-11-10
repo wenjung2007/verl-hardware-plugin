@@ -20,9 +20,8 @@ Phase 1 scope:
   and no rejection sampling), ``token-mean`` aggregation, no entropy term. Its tensor math is traced into the graph;
   verl's own ``ppo_loss`` then runs eagerly under ``no_grad`` on the per-token log-probs the graph returns, so the
   logged loss and metrics (``pg_clipfrac``, ``ppo_kl``, rollout-correction metrics, ...) are verl's.
-* One micro-batch per mini-batch per rank: TorchTitan's ``TpuGraphTrainer`` assigns ``param.grad`` instead of
-  accumulating it, so more micro-batches raise (TODO-1). Set ``ppo_max_token_len_per_gpu`` (with ``use_dynamic_bsz``)
-  and ``static_micro_batch_len`` large enough for one micro-batch. Its loss is normalized by the mini-batch's global
+* Gradient accumulation over a mini-batch's micro-batches accumulates into ``param.grad`` across calls to
+  ``forward_backward_step``; every micro-batch is padded to the same length and normalized by the mini-batch's global
   token count, as in the eager engine.
 * One sequence shape (``static_micro_batch_len``), traced once (TODO-2: cache one graph per bucket length).
 
@@ -54,10 +53,6 @@ NUM_LOSS_AUX_OUTPUTS = 1
 # The compile mode the TorchTitan TPU recipe parallelize_fn gets: skip the per-block torch.compile, keep SimpleFSDP.
 TPU_COMPILE_MODE = "aot_fx_trace"
 
-_TODO_1 = (
-    "graph_trainer mode runs one micro-batch per mini-batch per rank (TODO-1: gradient accumulation across "
-    "micro-batches)"
-)
 _TODO_2 = "graph_trainer mode traces one sequence shape and cannot retrace (TODO-2: one traced graph per bucket length)"
 _TODO_3 = (
     "graph_trainer mode has no forward-only path yet (TODO-3): run with algorithm.rollout_correction.bypass_mode=True "
@@ -78,13 +73,6 @@ def shape_change_error(traced_len: int, padded_len: int) -> RuntimeError:
     return RuntimeError(
         f"{_TODO_2}: traced with {traced_len} packed tokens, got {padded_len}. Raise "
         "engine_kwargs.tpu.static_micro_batch_len to at least the largest micro-batch (e.g. ppo_max_token_len_per_gpu)."
-    )
-
-
-def multi_micro_batch_error(num_micro_batches: int) -> RuntimeError:
-    return RuntimeError(
-        f"{_TODO_1}, got {num_micro_batches}. Raise actor.ppo_max_token_len_per_gpu (use_dynamic_bsz) and "
-        "engine_kwargs.tpu.static_micro_batch_len so that a mini-batch fits in one micro-batch per rank."
     )
 
 
@@ -148,10 +136,11 @@ def build_graph_trainer_config(
         raise ValueError("engine_kwargs.tpu.graph_trainer_fsdp_schedule requires a non-'none' memory_policy")
     # As TorchTitan's Qwen3-30B-A3B SFT recipe: remat barriers with the selective policy; FSDP schedules require them.
     enable_remat_barriers = memory_policy == "tpu_selective" or fsdp_schedule != "none"
+    use_graph_split = bool(options.graph_trainer_use_graph_split)
 
     tpu_fields = {f.name for f in dataclasses.fields(TPUConfig)}
     try:
-        from torchtitan.experiments.tpu.graph_trainer.config import TpuGraphTrainerCompileConfig
+        from torchtitan.experiments.tpu.graph_trainer.config import GraphSplitterConfig, TpuGraphTrainerCompileConfig
     except ImportError:
         from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 
@@ -163,6 +152,7 @@ def build_graph_trainer_config(
             graph_trainer_save_regions=save_regions,
             enable_graph_trainer_remat_schedule=enable_remat_barriers,
             graph_trainer_fsdp_schedule=fsdp_schedule,
+            use_graph_split=use_graph_split,
         )
         compile_config: Any = GraphTrainerCompileConfig(
             enable=False, mode=TPU_COMPILE_MODE, memory_policy=memory_policy
@@ -180,16 +170,18 @@ def build_graph_trainer_config(
             save_regions=save_regions,
             enable_remat_barriers=enable_remat_barriers,
             fsdp_barrier_policy=fsdp_schedule,
+            graph_split=GraphSplitterConfig(enabled=use_graph_split),
         )
 
     kwargs = dict(trainer_config_kwargs)
     kwargs.update(compile=compile_config, activation_checkpoint=None, tpu_config=tpu_config)
     logger.warning(
         "TPU trainer_mode=graph_trainer: TpuGraphTrainer (aot_fx_trace), memory_policy=%s, save_regions=%s, "
-        "fsdp_schedule=%s",
+        "fsdp_schedule=%s, graph_split=%s",
         memory_policy,
         save_regions,
         fsdp_schedule,
+        use_graph_split,
     )
     return TpuGraphTrainer.Config(**kwargs)
 
@@ -262,6 +254,17 @@ def _wrap_step_for_loss_aux(trainer: Any, num_aux: int):
     return _ctx()
 
 
+def _trainable_params_dedup(model_parts: list[torch.nn.Module]) -> list[torch.nn.Parameter]:
+    seen: set[int] = set()
+    params: list[torch.nn.Parameter] = []
+    for model in model_parts:
+        for param in model.parameters():
+            if param.requires_grad and id(param) not in seen:
+                seen.add(id(param))
+                params.append(param)
+    return params
+
+
 def _rl_graph_trainer_init(self: Any, cfg: Any) -> None:
     super(type(self), self).__init__(cfg)
     self.last_loss_aux = ()
@@ -275,6 +278,26 @@ def _rl_graph_trainer_init(self: Any, cfg: Any) -> None:
             group["capturable"] = False
 
 
+def _rl_graph_trainer_forward_backward_step(
+    self: Any, *, input_dict: dict[str, Any] | list[dict[str, Any]], global_valid_tokens: torch.Tensor
+) -> torch.Tensor:
+    # Stash existing gradients and clear param.grad before each micro-batch call so multi-microbatch steps
+    # accumulate identically whether the installed TpuGraphTrainer assigns or adds param.grad.
+    prev_grads: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
+    for param in _trainable_params_dedup(self.model_parts):
+        if param.grad is not None:
+            prev_grads.append((param, param.grad))
+            param.grad = None
+    loss = super(type(self), self).forward_backward_step(input_dict=input_dict, global_valid_tokens=global_valid_tokens)
+    for param, prev in prev_grads:
+        if param.grad is None:
+            param.grad = prev
+        else:
+            prev.add_(param.grad)
+            param.grad = prev
+    return loss
+
+
 def _rl_graph_trainer_make_fx_step(self: Any, *args: Any, **kwargs: Any) -> torch.Tensor:
     if self._has_native_loss_aux:
         return super(type(self), self)._make_fx_forward_backward_step(*args, **kwargs)
@@ -283,7 +306,7 @@ def _rl_graph_trainer_make_fx_step(self: Any, *args: Any, **kwargs: Any) -> torc
 
 
 def build_rl_graph_trainer(config: Any) -> Any:
-    """Builds a ``TpuGraphTrainer`` whose traced step also returns the detached per-token log-probs (aux output)."""
+    """Builds a ``TpuGraphTrainer`` with auxiliary log-prob outputs and multi-microbatch grad accumulation."""
     from torchtitan.experiments.tpu.graph_trainer.tpu_graph_trainer import TpuGraphTrainer
 
     cls = type(
@@ -291,6 +314,7 @@ def build_rl_graph_trainer(config: Any) -> Any:
         (TpuGraphTrainer,),
         {
             "__init__": _rl_graph_trainer_init,
+            "forward_backward_step": _rl_graph_trainer_forward_backward_step,
             "_make_fx_forward_backward_step": _rl_graph_trainer_make_fx_step,
         },
     )

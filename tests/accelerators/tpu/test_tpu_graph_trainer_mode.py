@@ -6,8 +6,8 @@
 The TPU compile pass needs ``torch_tpu`` on TPU (see ``tests/accelerators/tpu/e2e/graphtrainer_parity_check.py``).
 These check the parts that decide numerics and TorchTitan integration: the option surface, config construction across
 TorchTitan layouts, the trace-safe PPO loss against verl's, the packed loss inputs against verl's response layout, the
-out-of-place fused log-prob backward and fake-op shim, the RL ``TpuGraphTrainer`` wrapper's auxiliary outputs, and
-the one-micro-batch engine step.
+out-of-place fused log-prob backward and fake-op shim, and the RL ``TpuGraphTrainer`` wrapper's auxiliary outputs and
+multi-microbatch gradient accumulation.
 """
 
 from __future__ import annotations
@@ -73,10 +73,11 @@ def test_trainer_mode_options():
         graph_trainer_memory_policy="tpu_selective",
         graph_trainer_save_regions="moe.routing,attention.inner_attention",
         graph_trainer_fsdp_schedule="Interleave",
+        graph_trainer_use_graph_split=True,
         graph_trainer_autocast=False,
     )
     assert opts.graph_trainer_fsdp_schedule == "interleave"
-    assert opts.graph_trainer_autocast is False
+    assert opts.graph_trainer_use_graph_split is True and opts.graph_trainer_autocast is False
     with pytest.raises(ValueError, match="trainer_mode must be one of"):
         _options(trainer_mode="graph")
     with pytest.raises(ValueError, match="only apply with"):
@@ -487,7 +488,7 @@ class _TinyLM(torch.nn.Module):
 
 
 class _FakeGraphTrainer:
-    """Stands in for TpuGraphTrainer: runs the installed loss on a tiny model and its backward into .grad."""
+    """Stands in for TpuGraphTrainer: runs the installed loss on a tiny model and accumulates into .grad."""
 
     def __init__(self, model):
         self.model = model
@@ -561,39 +562,37 @@ def _engine_micro_batch(prompt_lens, response_lens, seed):
     return mb
 
 
-def test_graph_mode_step_matches_eager_ppo_loss_on_one_micro_batch():
-    """One micro-batch through the graph-mode engine step == eager verl ppo_loss (global tokens) and its backward."""
+def test_graph_mode_accumulates_micro_batches_with_the_global_token_count():
+    """Two micro-batches through the graph-mode engine loop == eager: sum of verl ppo_loss (global tokens) backward."""
     torch.manual_seed(0)
     padded_len = 48
-    micro_batch = _engine_micro_batch([3, 5, 2], [4, 6, 5], 1)
-    global_tokens = float(micro_batch["response_mask"].sum())
-    tu.assign_non_tensor(micro_batch, batch_num_tokens=global_tokens)
+    micro_batches = [_engine_micro_batch([3, 5], [4, 6], 1), _engine_micro_batch([2, 4, 3], [5, 2, 3], 2)]
+    global_tokens = float(sum(mb["response_mask"].sum() for mb in micro_batches))
+    for mb in micro_batches:
+        tu.assign_non_tensor(mb, batch_num_tokens=global_tokens)
     config = _actor_config()
     loss_fn = functools.partial(ppo_loss, config=config)
 
     model = _TinyLM()
     engine = _graph_engine(model, padded_len)
-    data = micro_batch.copy()
-    out = engine._graph_trainer_forward_backward(data, [micro_batch], None, loss_fn, global_tokens)
+    data = micro_batches[0].copy()
+    out = engine._graph_trainer_forward_backward(data, micro_batches, None, loss_fn, global_tokens)
     graph_grads = [p.grad.clone() for p in model.parameters()]
-    assert engine.trainer.calls == [((padded_len,), global_tokens)]
-    assert len(out["loss"]) == 1 and "actor/ppo_kl" in out["metrics"]
+    assert engine.trainer.calls == [((padded_len,), global_tokens)] * 2
+    assert len(out["loss"]) == 2 and "actor/ppo_kl" in out["metrics"]
 
-    # Eager reference: verl's ppo_loss on the same log-probs, backward.
+    # Eager reference: per micro-batch, verl's ppo_loss on the same log-probs, backward, accumulate.
     for p in model.parameters():
         p.grad = None
-    ids = micro_batch["input_ids"].values()
-    logp = torch.log_softmax(model(ids), -1).gather(-1, torch.roll(ids, -1)[:, None]).squeeze(-1)
-    output = {"log_probs": torch.nested.nested_tensor_from_jagged(logp, micro_batch["input_ids"].offsets())}
-    loss, _ = ppo_loss(config, model_output=output, data=micro_batch.copy())
-    loss.backward()
-    torch.testing.assert_close(float(loss), out["loss"][0], rtol=1e-5, atol=1e-6)
+    for mb, graph_loss in zip(micro_batches, out["loss"], strict=True):
+        ids = mb["input_ids"].values()
+        logp = torch.log_softmax(model(ids), -1).gather(-1, torch.roll(ids, -1)[:, None]).squeeze(-1)
+        output = {"log_probs": torch.nested.nested_tensor_from_jagged(logp, mb["input_ids"].offsets())}
+        loss, _ = ppo_loss(config, model_output=output, data=mb.copy())
+        loss.backward()
+        torch.testing.assert_close(float(loss), graph_loss, rtol=1e-5, atol=1e-6)
     for g, p in zip(graph_grads, model.parameters(), strict=True):
         torch.testing.assert_close(g, p.grad, rtol=1e-5, atol=1e-6)
-
-    # TpuGraphTrainer assigns param.grad, so a second micro-batch would drop the first one's gradients (TODO-1).
-    with pytest.raises(RuntimeError, match="TODO-1"):
-        engine._graph_trainer_forward_backward(data, [micro_batch, micro_batch], None, loss_fn, global_tokens)
 
     # A micro-batch with another padded length cannot reuse the traced step.
     engine.prepare_model_inputs = lambda micro_batch: (
@@ -603,7 +602,7 @@ def test_graph_mode_step_matches_eager_ppo_loss_on_one_micro_batch():
         {"labels": torch.zeros(64, dtype=torch.int64), "orig_seq_len": 1},
     )
     with pytest.raises(RuntimeError, match="TODO-2"):
-        engine._graph_trainer_forward_backward(data, [micro_batch], None, loss_fn, global_tokens)
+        engine._graph_trainer_forward_backward(data, micro_batches[:1], None, loss_fn, global_tokens)
 
 
 def test_build_graph_trainer_config_supports_new_and_legacy_torchtitan_layouts():
@@ -613,6 +612,10 @@ def test_build_graph_trainer_config_supports_new_and_legacy_torchtitan_layouts()
         bld_block_layout: bool = True
 
     @dataclasses.dataclass
+    class GraphSplitterConfig:
+        enabled: bool = False
+
+    @dataclasses.dataclass
     class TpuGraphTrainerCompileConfig:
         enable: bool = True
         mode: str = "aot_fx_trace"
@@ -620,6 +623,7 @@ def test_build_graph_trainer_config_supports_new_and_legacy_torchtitan_layouts()
         save_regions: tuple[str, ...] = ()
         enable_remat_barriers: bool = False
         fsdp_barrier_policy: str = "none"
+        graph_split: GraphSplitterConfig = dataclasses.field(default_factory=GraphSplitterConfig)
 
     class FakeTpuGraphTrainer:
         Config = lambda **kw: SimpleNamespace(**kw)  # noqa: E731
@@ -629,6 +633,7 @@ def test_build_graph_trainer_config_supports_new_and_legacy_torchtitan_layouts()
         graph_trainer_memory_policy="tpu_selective",
         graph_trainer_save_regions="moe.routing, attention.inner_attention",
         graph_trainer_fsdp_schedule="interleave",
+        graph_trainer_use_graph_split=True,
     )
     new_modules = {
         "torchtitan": SimpleNamespace(),
@@ -640,7 +645,7 @@ def test_build_graph_trainer_config_supports_new_and_legacy_torchtitan_layouts()
             TpuGraphTrainer=FakeTpuGraphTrainer
         ),
         "torchtitan.experiments.tpu.graph_trainer.config": SimpleNamespace(
-            TpuGraphTrainerCompileConfig=TpuGraphTrainerCompileConfig
+            GraphSplitterConfig=GraphSplitterConfig, TpuGraphTrainerCompileConfig=TpuGraphTrainerCompileConfig
         ),
     }
     with mock.patch.dict("sys.modules", new_modules):
@@ -653,6 +658,7 @@ def test_build_graph_trainer_config_supports_new_and_legacy_torchtitan_layouts()
             save_regions=("moe.routing", "attention.inner_attention"),
             enable_remat_barriers=True,
             fsdp_barrier_policy="interleave",
+            graph_split=GraphSplitterConfig(enabled=True),
         )
         assert cfg.activation_checkpoint is None and cfg.seed == 7
         with pytest.raises(ValueError, match="non-'none' memory_policy"):
@@ -675,6 +681,7 @@ def test_build_graph_trainer_config_supports_new_and_legacy_torchtitan_layouts()
         graph_trainer_save_regions: tuple[str, ...] = ()
         enable_graph_trainer_remat_schedule: bool = False
         graph_trainer_fsdp_schedule: str = "none"
+        use_graph_split: bool = False
 
     @dataclasses.dataclass
     class GraphTrainerCompileConfig:
@@ -704,8 +711,9 @@ def test_build_graph_trainer_config_supports_new_and_legacy_torchtitan_layouts()
         assert legacy_cfg.tpu_config.graph_trainer_fsdp_schedule == "interleave"
 
 
-def test_build_rl_graph_trainer_traces_aux_outputs():
-    """Unpatched upstream TpuGraphTrainer: RLTpuGraphTrainer returns detached aux log-probs; the trace is reused."""
+@pytest.mark.parametrize("base_accumulates_grads", [False, True])
+def test_build_rl_graph_trainer_traces_aux_outputs_and_accumulates_microbatches(base_accumulates_grads: bool):
+    """Unpatched upstream TpuGraphTrainer: RLTpuGraphTrainer returns detached aux log-probs and sums micro-batches."""
     from torch.fx.experimental.proxy_tensor import make_fx
 
     def upstream_make_fwd_bwd_step(model, loss_fn, *, collect_moe_routing_metrics: bool = False):
@@ -781,7 +789,10 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
             if self._collect_moe_routing_metrics:
                 self.routing_received.append(list(outputs[1 + len(params) :]))
             for param, grad in zip(params, grads, strict=True):
-                param.grad = grad
+                if base_accumulates_grads and param.grad is not None:
+                    param.grad = param.grad + grad
+                else:
+                    param.grad = grad
             return loss
 
     class TinyPosLM(torch.nn.Module):
@@ -827,11 +838,7 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
             mask = (torch.rand(12, generator=gen) > 0.2).float()
             mbs.append((tokens, (targets, old_lp, adv, mask), torch.arange(12)))
 
-        # Two training steps of one micro-batch each: the second reuses the traced graph.
         for tokens, labels, pos in mbs:
-            for m in (model, ref_model):
-                for p in m.parameters():
-                    p.grad = None
             loss = trainer.forward_backward_step(
                 input_dict={"input": tokens, "labels": labels, "positions": pos},
                 global_valid_tokens=global_tokens,
@@ -843,8 +850,8 @@ def test_build_rl_graph_trainer_traces_aux_outputs():
             ref_loss.backward()
             torch.testing.assert_close(loss, ref_loss.detach())
             torch.testing.assert_close(aux_logp, ref_logp)
-            for (_, p), (_, rp) in zip(model.named_parameters(), ref_model.named_parameters(), strict=True):
-                torch.testing.assert_close(p.grad, rp.grad)
 
-        # Routing metrics list kept its exact length (1 tensor per step), without leaking aux_logp into it.
+        # Routing metrics list kept its exact length (1 tensor per micro-batch), without leaking aux_logp into it.
         assert [len(r) for r in trainer.routing_received] == [1, 1]
+        for (_, p), (_, rp) in zip(model.named_parameters(), ref_model.named_parameters(), strict=True):
+            torch.testing.assert_close(p.grad, rp.grad)

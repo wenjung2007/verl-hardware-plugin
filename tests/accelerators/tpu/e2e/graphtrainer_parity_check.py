@@ -7,7 +7,7 @@ Builds the real TorchTitan TPU engine twice on one TPU host -- ``eager_blocks`` 
 loss and backward) and ``graph_trainer`` (TorchTitan's ``TpuGraphTrainer``: forward + fused log-prob + PPO loss +
 backward traced and compiled as one program) -- on the same Qwen3 MoE model (Qwen3-30B-A3B cut to its first
 ``PARITY_NUM_LAYERS`` layers, loaded from the full HF checkpoint) and the same synthetic GRPO micro-batch per rank
-(bypass mode, one micro-batch per rank, ``static_micro_batch_len``), and compares:
+(bypass mode, ``PARITY_MICRO_BATCHES`` micro-batches per rank, ``static_micro_batch_len``), and compares:
 
 1. the verl loss and metrics of the update micro-batch,
 2. the per-token log-probs of the response tokens,
@@ -26,6 +26,7 @@ Environment (defaults in brackets):
     PARITY_NUM_LAYERS        transformer layers kept [4]
     PARITY_STATIC_LEN        static_micro_batch_len = token budget of the micro-batch [4096]
     PARITY_NUM_SEQS          sequences per rank and micro-batch [6]
+    PARITY_MICRO_BATCHES     micro-batches per rank (gradient accumulation) [1]
     PARITY_CHIPS             TPU processes on the host [all TPU chips of the first TPU node]
     PARITY_FUSED_LCE         1: fused Tokamax log-prob (as the recipe), 0: plain LM head (the fallback) [1]
     PARITY_GRAPH_OPTIONS     extra engine_kwargs.tpu options of the graph run, JSON or k=v;k=v [{}]
@@ -67,6 +68,7 @@ MODEL_PATH = os.environ.get("PARITY_MODEL_PATH", "Qwen/Qwen3-30B-A3B")
 NUM_LAYERS = int(os.environ.get("PARITY_NUM_LAYERS", "4"))
 STATIC_LEN = int(os.environ.get("PARITY_STATIC_LEN", "4096"))
 NUM_SEQS = int(os.environ.get("PARITY_NUM_SEQS", "6"))
+MICRO_BATCHES = int(os.environ.get("PARITY_MICRO_BATCHES", "1"))
 FUSED_LCE = os.environ.get("PARITY_FUSED_LCE", "1") == "1"
 # Draw the batch's tokens from embedding rows with norm >= this x the median (0: the whole vocabulary).
 MIN_EMB_NORM_FRAC = float(os.environ.get("PARITY_MIN_EMB_NORM_FRAC", "0.25"))
@@ -162,10 +164,11 @@ def build_batch(rank: int, dp_size: int, vocab_size: int, token_pool: Optional[t
     Token ids are drawn uniformly from ``token_pool`` (default: the whole vocabulary).
     """
     gen = torch.Generator().manual_seed(SEED + rank)
-    # One static-length micro-batch of whole sequences (use_dynamic_bsz with max_token_len_per_gpu = STATIC_LEN).
-    budget = STATIC_LEN - 1
+    # MICRO_BATCHES > 1: about that many static-length micro-batches of whole sequences (use_dynamic_bsz with
+    # max_token_len_per_gpu = STATIC_LEN), to exercise gradient accumulation.
+    budget = STATIC_LEN * MICRO_BATCHES - 1 - (MICRO_BATCHES - 1) * (MAX_PROMPT + MAX_RESPONSE)
     prompt_lens, response_lens = [], []
-    for _ in range(NUM_SEQS):
+    for _ in range(NUM_SEQS * MICRO_BATCHES):
         p = int(torch.randint(16, MAX_PROMPT + 1, (1,), generator=gen))
         r = int(torch.randint(16, MAX_RESPONSE + 1, (1,), generator=gen))
         if sum(prompt_lens) + sum(response_lens) + p + r > budget:
@@ -749,8 +752,8 @@ def main() -> int:
     _, slice_name, host_chips = discover_tpu_host()
     chips = int(os.environ.get("PARITY_CHIPS", host_chips))
     log(
-        f"model={MODEL_PATH} layers={NUM_LAYERS} static_len={STATIC_LEN} seqs/rank<={NUM_SEQS} "
-        f"chips={chips} "
+        f"model={MODEL_PATH} layers={NUM_LAYERS} static_len={STATIC_LEN} seqs/rank<={NUM_SEQS * MICRO_BATCHES} "
+        f"micro_batches~{MICRO_BATCHES} chips={chips} "
         f"slice={slice_name or '-'} fused_lce={FUSED_LCE} graph_options={GRAPH_OPTIONS} modes={MODES}"
     )
 

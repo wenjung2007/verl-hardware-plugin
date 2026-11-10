@@ -1509,19 +1509,17 @@ class TorchTitanTPUEngine(BaseEngine):
         loss_function: Callable,
         batch_num_tokens: Any,
     ) -> dict[str, Any]:
-        """``trainer_mode=graph_trainer``: the mini-batch's micro-batch through TorchTitan's traced training step.
+        """``trainer_mode=graph_trainer``: the mini-batch's micro-batches through TorchTitan's traced training step.
 
-        The micro-batch is prepared as in the eager engine (packed, bucket-padded to ``static_micro_batch_len``, same
-        shape on every rank), so the one traced, compiled step serves every step.
+        Every micro-batch is prepared as in the eager engine (packed, bucket-padded to ``static_micro_batch_len``,
+        same shape on every rank), so the one traced, compiled step serves all of them.
         ``TpuGraphTrainer.forward_backward_step`` runs the model, the fused LM-head log-prob, the PPO policy loss and
-        the backward as one executable and writes the gradients to ``param.grad`` for the unchanged
-        ``optimizer_step``. It assigns rather than accumulates ``param.grad``, so exactly one micro-batch per mini-batch
-        per rank is supported (TODO-1). The loss is normalized by the mini-batch's GLOBAL token count, as in the eager
-        engine. verl's ``ppo_loss`` then runs eagerly under ``no_grad`` on the per-token log-probs the graph returns,
-        so the reported loss and metrics are the eager engine's.
+        the backward as one executable and accumulates the gradients into ``param.grad`` for the unchanged
+        ``optimizer_step``. Each micro-batch's loss is normalized by the mini-batch's GLOBAL token count, as in the
+        eager engine, so the accumulated gradient is the global token mean. verl's ``ppo_loss`` then runs eagerly under
+        ``no_grad`` on the per-token log-probs the graph returns, so the reported loss and metrics are the eager
+        engine's.
         """
-        if len(micro_batches) != 1:
-            raise graph_trainer_mode.multi_micro_batch_error(len(micro_batches))
         self._ensure_graph_policy_loss(loss_function, micro_batches[0])
         timeline_ctx = timeline.span(
             "fwd_bwd",

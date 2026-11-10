@@ -53,7 +53,7 @@ per-backend options (`rollout.engine_kwargs.vllm`), e.g.
 `tpu_eager_mode`, `optim_impl`, `seq_bucket_size`, `static_micro_batch_len`, `splash_max_block_size`,
 `mixed_precision_reduce`, `moe_paired_grouped_mm`, `moe_native_weight_layout`, `trainer_mode`,
 `graph_trainer_memory_policy`, `graph_trainer_save_regions`, `graph_trainer_fsdp_schedule`,
-`graph_trainer_autocast`, `graph_trainer_f32_embedding_grad`, `model_kernels`,
+`graph_trainer_use_graph_split`, `graph_trainer_autocast`, `graph_trainer_f32_embedding_grad`, `model_kernels`,
 `ep_capacity_factor` and `context_parallel_strategy` (see `TPUEngineOptions` in `options.py`); an unknown key is an error. The older `torchtitan.<option>` fields and `VERL_TPU_*` environment variables still work but are
 deprecated and log a warning.
 
